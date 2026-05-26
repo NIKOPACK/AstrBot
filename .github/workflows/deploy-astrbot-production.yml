@@ -1,0 +1,268 @@
+name: Deploy AstrBot Production
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "README*.md"
+      - "changelogs/**"
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: astrbot-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  validate:
+    if: github.repository == 'NIKOPACK/AstrBot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install uv
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run targeted tests
+        run: uv run pytest tests/test_weixin_oc_sendmessage_retry.py -q
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Check lint
+        run: uv run ruff check .
+
+  build-image:
+    if: github.repository == 'NIKOPACK/AstrBot'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    outputs:
+      image-ref: ${{ steps.image.outputs.ref }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6.0.8
+        with:
+          version: 10.28.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.13.0"
+          cache: "pnpm"
+          cache-dependency-path: dashboard/pnpm-lock.yaml
+
+      - name: Build WebUI
+        shell: bash
+        run: |
+          cd dashboard
+          pnpm config set registry https://registry.npmjs.org/
+          pnpm install --frozen-lockfile
+          pnpm run build
+          cd ..
+
+          version="$(python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              version = tomllib.load(f)["project"]["version"]
+          print(f"v{version}")
+          PY
+          )"
+
+          mkdir -p dashboard/dist/assets astrbot/dashboard
+          printf "%s\n" "$version" > dashboard/dist/assets/version
+          rm -rf astrbot/dashboard/dist
+          cp -R dashboard/dist astrbot/dashboard/dist
+
+      - name: Compute image tags
+        id: image
+        shell: bash
+        run: |
+          image_repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          short_sha="${GITHUB_SHA::12}"
+          echo "repo=$image_repo" >> "$GITHUB_OUTPUT"
+          echo "tag=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "ref=$image_repo:$short_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7.1.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.ref }}
+            ${{ steps.image.outputs.repo }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  deploy:
+    if: github.repository == 'NIKOPACK/AstrBot'
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+
+    env:
+      IMAGE_REF: ${{ needs.build-image.outputs.image-ref }}
+      SERVER_HOST: ${{ secrets.ASTRBOT_SERVER_HOST }}
+      SERVER_USER: ${{ secrets.ASTRBOT_SERVER_USER }}
+      SERVER_PORT: ${{ secrets.ASTRBOT_SERVER_PORT }}
+      SERVER_SSH_HOST_KEY: ${{ secrets.ASTRBOT_SERVER_SSH_HOST_KEY }}
+      DEPLOY_PATH: ${{ secrets.ASTRBOT_DEPLOY_PATH }}
+      SSH_KEY: ${{ secrets.ASTRBOT_DEPLOY_SSH_KEY }}
+      GHCR_USERNAME: ${{ github.actor }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Validate deployment secrets
+        shell: bash
+        run: |
+          : "${SERVER_HOST:?Missing ASTRBOT_SERVER_HOST secret}"
+          : "${SERVER_USER:?Missing ASTRBOT_SERVER_USER secret}"
+          : "${SSH_KEY:?Missing ASTRBOT_DEPLOY_SSH_KEY secret}"
+
+          echo "SERVER_PORT=${SERVER_PORT:-22}" >> "$GITHUB_ENV"
+          echo "DEPLOY_PATH=${DEPLOY_PATH:-/opt/AstrBot}" >> "$GITHUB_ENV"
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          printf "%s\n" "$SSH_KEY" > ~/.ssh/astrbot_deploy_key
+          chmod 600 ~/.ssh/astrbot_deploy_key
+
+          if [ -n "$SERVER_SSH_HOST_KEY" ]; then
+            printf "%s\n" "$SERVER_SSH_HOST_KEY" >> ~/.ssh/known_hosts
+          else
+            ssh-keyscan -p "$SERVER_PORT" "$SERVER_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Log in to GHCR on server
+        shell: bash
+        run: |
+          printf "%s" "$GHCR_TOKEN" | ssh \
+            -i ~/.ssh/astrbot_deploy_key \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "docker login ghcr.io -u '$GHCR_USERNAME' --password-stdin"
+
+      - name: Deploy image
+        shell: bash
+        run: |
+          ssh \
+            -i ~/.ssh/astrbot_deploy_key \
+            -p "$SERVER_PORT" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "IMAGE_REF='$IMAGE_REF' DEPLOY_PATH='$DEPLOY_PATH' bash -se" <<'REMOTE'
+          set -euo pipefail
+
+          if [ ! -d "$DEPLOY_PATH" ]; then
+            echo "Deploy path does not exist: $DEPLOY_PATH" >&2
+            exit 1
+          fi
+
+          cd "$DEPLOY_PATH"
+          if [ ! -f compose.yml ]; then
+            echo "compose.yml does not exist in $DEPLOY_PATH" >&2
+            exit 1
+          fi
+
+          backup_dir="/opt/astrbot-backups/deploy"
+          mkdir -p "$backup_dir"
+          cp compose.yml "$backup_dir/compose-$(date +%Y%m%d-%H%M%S).yml"
+
+          python3 - "$IMAGE_REF" <<'PY'
+          from pathlib import Path
+          import sys
+
+          image_ref = sys.argv[1]
+          path = Path("compose.yml")
+          lines = path.read_text(encoding="utf-8").splitlines()
+          in_astrbot_service = False
+          updated = False
+
+          for index, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped == "astrbot:":
+                  in_astrbot_service = True
+                  continue
+              if in_astrbot_service and stripped.startswith("image:"):
+                  indent = line[: len(line) - len(line.lstrip())]
+                  lines[index] = f"{indent}image: {image_ref}"
+                  updated = True
+                  break
+
+          if not updated:
+              raise SystemExit("compose.yml does not contain services.astrbot.image")
+
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+          docker compose config >/tmp/astrbot-compose-config.out
+          docker compose pull astrbot
+          docker compose up -d astrbot
+          docker compose ps astrbot
+
+          for _ in $(seq 1 30); do
+            status="$(curl -fsS -o /tmp/astrbot-health.out -w "%{http_code}" http://127.0.0.1:6185/ || true)"
+            if [ "$status" = "200" ]; then
+              echo "AstrBot WebUI is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "AstrBot WebUI did not become healthy" >&2
+          docker logs --tail 160 astrbot >&2
+          exit 1
+          REMOTE
+
+      - name: Log out from GHCR on server
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f ~/.ssh/astrbot_deploy_key ] || [ -z "${SERVER_HOST:-}" ]; then
+            exit 0
+          fi
+
+          ssh \
+            -i ~/.ssh/astrbot_deploy_key \
+            -p "${SERVER_PORT:-22}" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "docker logout ghcr.io >/dev/null 2>&1 || true" || true

@@ -108,6 +108,8 @@ class WeixinOCAdapter(Platform):
     REPLY_MATCH_WINDOW_MS = 60_000
     RECENT_SESSION_CACHE_TTL_S = 1_800
     MAX_RECENT_MESSAGE_SESSIONS = 500
+    SENDMESSAGE_RETRYABLE_RET_CODES = frozenset({-2})
+    SENDMESSAGE_RETRY_DELAYS_S = (2.0, 5.0, 10.0)
 
     def __init__(
         self,
@@ -873,10 +875,9 @@ class WeixinOCAdapter(Platform):
                 user_id,
             )
             return False
-        payload = await self.client.request_json(
-            "POST",
-            "ilink/bot/sendmessage",
-            payload={
+        payload = await self._request_sendmessage_with_retry(
+            user_id,
+            {
                 "base_info": {
                     "channel_version": "astrbot",
                 },
@@ -890,8 +891,6 @@ class WeixinOCAdapter(Platform):
                     "item_list": item_list,
                 },
             },
-            token_required=True,
-            headers={},
         )
         if not self._is_successful_api_payload(payload):
             logger.warning(
@@ -925,6 +924,49 @@ class WeixinOCAdapter(Platform):
         )
         return True
 
+    async def _request_sendmessage_with_retry(
+        self,
+        user_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        max_attempts = len(self.SENDMESSAGE_RETRY_DELAYS_S) + 1
+        for attempt_index in range(max_attempts):
+            response = await self.client.request_json(
+                "POST",
+                "ilink/bot/sendmessage",
+                payload=payload,
+                token_required=True,
+                headers={},
+            )
+            if self._is_successful_api_payload(response):
+                if attempt_index > 0:
+                    logger.info(
+                        "weixin_oc(%s): sendmessage succeeded for %s after %s attempts",
+                        self.meta().id,
+                        user_id,
+                        attempt_index + 1,
+                    )
+                return response
+
+            if not self._is_retryable_sendmessage_payload(response):
+                return response
+            if attempt_index >= len(self.SENDMESSAGE_RETRY_DELAYS_S):
+                return response
+
+            delay_s = self.SENDMESSAGE_RETRY_DELAYS_S[attempt_index]
+            logger.warning(
+                "weixin_oc(%s): sendmessage retryable failure for %s on attempt %s/%s: %s; retrying in %.1fs",
+                self.meta().id,
+                user_id,
+                attempt_index + 1,
+                max_attempts,
+                self._format_api_error(response),
+                delay_s,
+            )
+            await asyncio.sleep(delay_s)
+
+        raise RuntimeError("unreachable sendmessage retry state")
+
     def _build_cache_components_from_items(
         self,
         item_list: list[dict[str, Any]],
@@ -951,6 +993,12 @@ class WeixinOCAdapter(Platform):
         errcode = int(payload.get("errcode") or 0)
         errmsg = str(payload.get("errmsg", ""))
         return f"ret={ret}, errcode={errcode}, errmsg={errmsg}"
+
+    @classmethod
+    def _is_retryable_sendmessage_payload(cls, payload: dict[str, Any]) -> bool:
+        ret = int(payload.get("ret") or 0)
+        errcode = int(payload.get("errcode") or 0)
+        return ret in cls.SENDMESSAGE_RETRYABLE_RET_CODES and errcode == 0
 
     @staticmethod
     def _api_errcode(payload: dict[str, Any]) -> int:
